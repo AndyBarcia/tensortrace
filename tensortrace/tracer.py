@@ -71,7 +71,7 @@ class ModelTracer:
             # previous version of the tensor, using its version counter to
             # easily check for changes.
             if (
-                self.last_result_data_ptr.get(var_name) != value.untyped_storage().data_ptr() or
+                self.last_result_data_ptr.get(var_name) != id(value) or
                 self.last_result_version_counter.get(var_name) != value._version
             ):
                 if var_name not in self.results:
@@ -82,7 +82,7 @@ class ModelTracer:
                     self.results_iterations[var_name].append(self.current_iteration)
                 
                 # Save tensor data pointer and version counter to keep track of future changes.
-                self.last_result_data_ptr[var_name] = value.untyped_storage().data_ptr()
+                self.last_result_data_ptr[var_name] = id(value)
                 self.last_result_version_counter[var_name] = value._version
         elif isinstance(value, (int, float, complex, str, bytes, bool, type(None))):
             # If it's a simple type, just compare it to check if it changed
