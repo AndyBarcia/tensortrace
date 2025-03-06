@@ -1,5 +1,6 @@
 from typing import List, Any
 import collections.abc
+from itertools import chain
 
 
 def get_object_items(obj):
@@ -14,16 +15,22 @@ def get_object_items(obj):
     if isinstance(obj, collections.abc.Iterable):
         return enumerate(iter(obj))
     
+    fields = []
     # Objects with __dict__
     if hasattr(obj, '__dict__'):
-        return obj.__dict__.items()
-        
+        fields.append(obj.__dict__.items())
+    # Modules
+    if hasattr(obj, '_modules'):
+        fields.append(obj._modules.items())
+    # Parameters
+    if hasattr(obj, '_parameters'):
+        fields.append(obj._parameters.items())
     # Named tuples
     if hasattr(obj, '_fields'):
-        return obj._asdict().items()
+        fields.append(obj._asdict().items())
     
     # Default to empty list if no keys found
-    return []
+    return chain.from_iterable(fields)
 
 
 def get_object_value(obj, key):
@@ -42,6 +49,8 @@ def get_object_value(obj, key):
                 return obj.__dict__['_modules'][key]
             if '_parameters' in obj.__dict__ and key in obj.__dict__['_parameters']:
                 return obj.__dict__['_parameters'][key]
+            if '_buffers' in obj.__dict__ and key in obj.__dict__['_buffers']:
+                return obj.__dict__['_buffers'][key]
         
         # Objects with __slots__
         if hasattr(obj, '__slots__') and key in obj.__slots__:
