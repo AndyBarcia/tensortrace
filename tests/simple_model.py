@@ -32,7 +32,7 @@ with ModelTracer(model, [
 ]) as tracer:
     for _ in range(10):
         input_tensor = torch.randn(1, 10)
-        output = tracer(input_tensor)
+        output = model(input_tensor)
 
 # Example accessing values:
 variable_values = tracer.results['forward.self.variable']

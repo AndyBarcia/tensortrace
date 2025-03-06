@@ -31,6 +31,9 @@ class ModelTracer:
         self, 
         model: nn.Module, 
         variables: List[str], 
+        trace_interval = 1,
+        eval_only = False,
+        train_only = False,
     ):
         """
         Initialize ModelTracer as a context manager for tracing model variables
@@ -41,6 +44,11 @@ class ModelTracer:
         """
         self.model = model
         self.variables = variables
+        self.trace_interval = trace_interval
+        self.eval_only = eval_only
+        self.train_only = train_only
+
+        assert not (self.eval_only and self.train_only), "You can't set both 'eval_only' and 'train_only' to True."
 
         # Paths of variables or modules we are interested in
         self.target_paths = [name.split('.') for name in self.variables] 
@@ -70,9 +78,12 @@ class ModelTracer:
             # If it's a tensor, save it only if it changed with respect to the
             # previous version of the tensor, using its version counter to
             # easily check for changes.
+            # TODO: version counter doesn't appear to work with buffers?
+            # Do something about it instead of saving every iteration.
             if (
                 self.last_result_data_ptr.get(var_name) != id(value) or
-                self.last_result_version_counter.get(var_name) != value._version
+                self.last_result_version_counter.get(var_name) != value._version or
+                self.current_iteration != self.results_iterations.get(var_name, [0])[-1]
             ):
                 if var_name not in self.results:
                     self.results[var_name] = [value.clone().detach()]
@@ -109,98 +120,133 @@ class ModelTracer:
                     
                 self.last_result_data_ptr[var_name] = id(value)
 
+    def _trace_calls(self, frame, event, arg, target_paths):
+        """Trace function to capture local variables"""
+        if event == "call":            
+            # If this function doesn't accept self, we can't track it, so don't bother 
+            # tracing its body.
+            if 'self' not in frame.f_locals:
+                return self.original_trace    
+            
+            # If 'self' is not a tracked module of our model, or we can't
+            # even get the hash of the module, we shouldn't track it, nor its body.
+            self_obj = frame.f_locals['self']
+            try:
+                module_path = self.submodule_to_path[self_obj]
+            except Exception:
+                return self.original_trace
+
+            # Get all target paths that are subpaths of the current module.
+            sub_target_paths = [
+                target_path for target_path in target_paths 
+                if partial_path_matching(target_path, module_path)
+            ]
+
+            # If we are not interesting in any variable of this function, don't keep tracing.
+            # Otherwise, keep tracing the variables we are interested in.
+            if not sub_target_paths:
+                return self.original_trace
+            return partial(self._trace_calls, target_paths=sub_target_paths)
+        elif event == "line":
+            # If this is a line of a function we are interested in, we should check
+            # all its local variables to see if they match any of the target variables.
+            func_name = frame.f_code.co_name
+            self_obj = frame.f_locals['self']
+            module_path = self.submodule_to_path[self_obj]
+
+            sub_target_paths = [
+                target_path[len(module_path)+1:] 
+                for target_path in target_paths
+                if len(module_path) < len(target_path) and target_path[len(module_path)] == func_name
+            ]
+
+            for var_name, var_value in extract_nested_values(frame.f_locals, sub_target_paths).items():
+                qualified_path = module_path + [func_name, var_name]
+                output_name = '.'.join(qualified_path)
+                self.save_variable_result(output_name, var_value)
+            
+            # Keep on tracing this function.
+            return partial(self._trace_calls, target_paths=target_paths)
+        elif event == "return":
+            # If this is the return of a function we are interested in, check if we should
+            # save its output.
+            func_name = frame.f_code.co_name
+            self_obj = frame.f_locals['self']
+            module_path = self.submodule_to_path[self_obj]
+
+            qualified_path = module_path + [func_name]
+            if any([exact_path_matching(target_path, qualified_path) for target_path in target_paths]):
+                output_name = '.'.join(qualified_path)
+                self.save_variable_result(output_name, arg)
+            elif func_name == "forward" and any([exact_path_matching(target_path, module_path) for target_path in target_paths]):
+                output_name = '.'.join(module_path)
+                self.save_variable_result(output_name, arg)
+
+            return
+        return partial(self._trace_calls, target_paths=target_paths)
+
     def __enter__(self):
-        """Enter the context manager and set up tracing"""
-        self.original_trace = sys.gettrace()
+        # When entering the context, we need to wrap the model's forward function
+        # to enable tracing. After exiting the context, we will restore the original 
+        # function.
+        self.original_forward = self.model.forward
 
-        def _trace_calls(frame, event, arg, target_paths):
-            """Trace function to capture local variables"""
-            if event == "call":            
-                # If this function doesn't accept self, we can't track it, so don't bother 
-                # tracing its body.
-                if 'self' not in frame.f_locals:
-                    return self.original_trace    
-                
-                # If 'self' is not a tracked module of our model, or we can't
-                # even get the hash of the module, we shouldn't track it, nor its body.
-                self_obj = frame.f_locals['self']
-                try:
-                    module_path = self.submodule_to_path[self_obj]
-                except Exception:
-                    return self.original_trace
+        def wrapped_forward(*args, **kwargs):
+            if (
+                (self.eval_only and self.model.training) or
+                (self.train_only and not self.model.training)
+            ):
+                # If we are not in a mode we are interested in, just call the original forward.
+                # This is useful for example when we are training a model and we only want to trace
+                # the evaluation phase.
+                return self.original_forward(*args, **kwargs)
 
-                # Get all target paths that are subpaths of the current module.
-                sub_target_paths = [
-                    target_path for target_path in target_paths 
-                    if partial_path_matching(target_path, module_path)
-                ]
+            self.current_iteration += 1
+            trace_needed = self.current_iteration % self.trace_interval == 0
+            if trace_needed:
+                original_trace = sys.gettrace()
+                sys.settrace(partial(self._trace_calls, target_paths=self.target_paths))
 
-                # If we are not interesting in any variable of this function, don't keep tracing.
-                # Otherwise, keep tracing the variables we are interested in.
-                if not sub_target_paths:
-                    return self.original_trace
-                return partial(_trace_calls, target_paths=sub_target_paths)
-            elif event == "line":
-                # If this is a line of a function we are interested in, we should check
-                # all its local variables to see if they match any of the target variables.
-                func_name = frame.f_code.co_name
-                self_obj = frame.f_locals['self']
-                module_path = self.submodule_to_path[self_obj]
+            try:
+                output = self.original_forward(*args, **kwargs)
+            finally:
+                if trace_needed:
+                    sys.settrace(original_trace)
 
-                sub_target_paths = [
-                    target_path[len(module_path)+1:] 
-                    for target_path in target_paths
-                    if len(module_path) < len(target_path) and target_path[len(module_path)] == func_name
-                ]
+            return output
 
-                for var_name, var_value in extract_nested_values(frame.f_locals, sub_target_paths).items():
-                    qualified_path = module_path + [func_name, var_name]
-                    output_name = '.'.join(qualified_path)
-                    self.save_variable_result(output_name, var_value)
-                
-                # Keep on tracing this function.
-                return partial(_trace_calls, target_paths=target_paths)
-            elif event == "return":
-                # If this is the return of a function we are interested in, check if we should
-                # save its output.
-                func_name = frame.f_code.co_name
-                self_obj = frame.f_locals['self']
-                module_path = self.submodule_to_path[self_obj]
-
-                qualified_path = module_path + [func_name]
-                if any([exact_path_matching(target_path, qualified_path) for target_path in target_paths]):
-                    output_name = '.'.join(qualified_path)
-                    self.save_variable_result(output_name, arg)
-                elif func_name == "forward" and any([exact_path_matching(target_path, module_path) for target_path in target_paths]):
-                    output_name = '.'.join(module_path)
-                    self.save_variable_result(output_name, arg)
-
-                return
-            return partial(_trace_calls, target_paths=target_paths)
-
-        # Add trace to save intermediate variables
-        sys.settrace(partial(_trace_calls, target_paths=self.target_paths))
-        
+        self.model.forward = wrapped_forward
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Exit the context manager and restore the original trace function"""
-        sys.settrace(self.original_trace)
-    
-    def __call__(self, *args, **kwargs):
-        """Run the model within the tracing context"""
-        self.current_iteration += 1
-        output = self.model(*args, **kwargs)
-        return output
+        self.model.forward = self.original_forward
 
 
 def trace_model(
     model: nn.Module, 
-    variables: List[str], 
+    variables: List[str],
     *args, 
     **kwargs
 ) -> Dict[str, List[Any]]:
     with ModelTracer(model, variables) as tracer:
-        output = tracer(*args, **kwargs)
+        output = model(*args, **kwargs)
 
     return output, tracer
+
+
+class TracedModel(nn.Module):
+    def __init__(
+        self, 
+        model: nn.Module,
+        variables: List[str], 
+        trace_interval = 1,
+        eval_only = False,
+        train_only = False,
+    ):
+        super().__init__()
+        self.model = model
+        self.tracer = ModelTracer(model, variables, trace_interval, eval_only, train_only)
+    
+    def forward(self, *args, **kwargs):
+        with self.tracer:
+            return self.model(*args, **kwargs)

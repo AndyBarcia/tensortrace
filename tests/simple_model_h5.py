@@ -42,7 +42,7 @@ with ModelTracerH5PY(
 ) as traced_model:
     for _ in range(10):
         input_tensor = torch.randn(1, 10)
-        output = traced_model(input_tensor)
+        output = model(input_tensor)
 
 # Load data from the HDF5 file
 with h5py.File(h5py_filename, 'r') as f:

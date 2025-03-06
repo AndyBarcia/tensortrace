@@ -1,8 +1,10 @@
 from .tracer import ModelTracer
 
+import sys
 import torch
 import torch.nn as nn
 import numpy as np
+from functools import partial
 from typing import List, Any, Type,Optional
 import h5py
 from pathlib import Path
@@ -14,7 +16,10 @@ class ModelTracerH5PY(ModelTracer):
         model: nn.Module, 
         variables: List[str],
         dataset_file: str,
+        trace_interval = 1,
         saving_interval = 1,
+        eval_only = False,
+        train_only = False,
         iteration_dtype: Type = np.int64,
         float_dtype: Type = np.float32,
         int_dtype: Type = np.int32,
@@ -22,7 +27,7 @@ class ModelTracerH5PY(ModelTracer):
         compression_opts: Optional[int] = None,
         shuffle: bool = False,
     ):
-        super().__init__(model, variables)
+        super().__init__(model, variables, trace_interval, eval_only, train_only)
         self.saving_interval = saving_interval
 
         # Dataset type configurations
@@ -165,20 +170,83 @@ class ModelTracerH5PY(ModelTracer):
             else:
                 self._write_simple_type_dataset(name, normalized_variables, self.results_iterations[name])
 
-    def __call__(self, *args, **kwargs):
-        """Run the model within the tracing context"""
-        self.current_iteration += 1
-        output = self.model(*args, **kwargs)
+    def __enter__(self):
+        # When entering the context, we need to wrap the model's forward function
+        # to enable tracing. After exiting the context, we will restore the original 
+        # function.
+        self.original_forward = self.model.forward
 
-        # If not saving this iteration, just return the output
-        if self.current_iteration % self.saving_interval != 0:
+        def wrapped_forward(*args, **kwargs):
+            self.current_iteration += 1
+
+            trace_needed = (
+                self.current_iteration % self.trace_interval == 0 and
+                (not self.eval_only or not self.model.training) and
+                (not self.train_only or self.model.training)
+            )
+
+            if trace_needed:
+                original_trace = sys.gettrace()
+                sys.settrace(partial(self._trace_calls, target_paths=self.target_paths))
+
+            try:
+                output = self.original_forward(*args, **kwargs)
+            finally:
+                if trace_needed:
+                    sys.settrace(original_trace)
+
+            # If not saving this iteration, just return the output
+            if self.current_iteration % self.saving_interval != 0:
+                return output
+
+            # Write results to the h5py file
+            self.write_results()
+
+            # Reset tracked variables for this iteration
+            self.results = {}
+            self.results_iterations = {}
+
             return output
 
-        # Write results to the h5py file
-        self.write_results()
+        self.model.forward = wrapped_forward
+        return self
 
-        # Reset tracked variables for this iteration
-        self.results = {}
-        self.results_iterations = {}
 
-        return output
+class H5PYTracedModel(nn.Module):
+    def __init__(
+        self, 
+        model: nn.Module, 
+        variables: List[str],
+        dataset_file: str,
+        trace_interval = 1,
+        saving_interval = 1,
+        eval_only = False,
+        train_only = False,
+        iteration_dtype: Type = np.int64,
+        float_dtype: Type = np.float32,
+        int_dtype: Type = np.int32,
+        compression: Optional[str] = None,
+        compression_opts: Optional[int] = None,
+        shuffle: bool = False,
+    ):
+        super()
+        self.model = model
+        self.tracer = ModelTracerH5PY(
+            model, 
+            variables, 
+            dataset_file, 
+            trace_interval, 
+            saving_interval, 
+            eval_only, 
+            train_only, 
+            iteration_dtype, 
+            float_dtype, 
+            int_dtype, 
+            compression, 
+            compression_opts, 
+            shuffle
+        )
+
+    def forward(self, *args, **kwargs):
+        with self.tracer:
+            return self.model(*args, **kwargs)
