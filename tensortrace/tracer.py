@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel, DataParallel
-from typing import List, Dict, DefaultDict, Any, Tuple, Callable
+from typing import List, Dict, DefaultDict, Any, Tuple, Callable, Optional
+import torch.nn.functional as F
 import sys
 from copy import deepcopy
 from functools import partial
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 import torch.distributed as dist
 
 from .utils import extract_nested_values
@@ -29,6 +30,10 @@ def exact_path_matching(target_path: List[str], path: List[str]):
     return True
 
 
+# Define a named tuple for storing the aggregated results
+ResultEntry = namedtuple('ResultEntry', ['iterations', 'ranks', 'values'])
+
+
 class ModelTracer:
     def __init__(
         self, 
@@ -39,6 +44,7 @@ class ModelTracer:
         pre_save_callbacks: List[Callable[[str, Any, int], Any]] = [],
         pre_gather_callbacks: List[Callable[[str, List[Any], List[int]], None]] = [],
         post_gather_callbacks: List[Callable[[str, List[Any], List[int], List[int]], None]] = [],
+        post_trace_callbacks: List[Callable[[str, List[Any], List[int], List[int]], None]] = [],
         eval_only = False,
         train_only = False,
     ):
@@ -65,6 +71,7 @@ class ModelTracer:
         self.pre_save_callbacks = pre_save_callbacks
         self.pre_gather_callbacks = pre_gather_callbacks
         self.post_gather_callbacks = post_gather_callbacks
+        self.post_trace_callbacks = post_trace_callbacks
 
         assert not (self.eval_only and self.train_only), "You can't set both 'eval_only' and 'train_only' to True."
 
@@ -81,7 +88,7 @@ class ModelTracer:
         self.local_results: DefaultDict[str, Tuple[List[int], List[Any]]] = defaultdict(lambda: ([],[]))
 
         # Global aggregated storage (on rank 0), with tuples (iteration, rank, value) 
-        self.results: DefaultDict[str, Tuple[List[int], List[int], List[Any]]] = defaultdict(lambda: ([],[],[]))
+        self.results: DefaultDict[str, ResultEntry] = defaultdict(lambda: ResultEntry([], [], []))
 
         # Determine rank of this tracer.
         self.rank = 0
@@ -248,6 +255,12 @@ class ModelTracer:
                     global_ranks.extend(ranks)
                     global_values.extend(values)
         else:
+            # Allow processing the values of several iterations together after they
+            # have been grouped together.
+            for callback in self.post_gather_callbacks:
+                for name, (iterations, values) in self.local_results.items():
+                    callback(name, values, iterations, None)
+            
             # If this is not a distributed setup, just add the rank 0 identifier.
             for var_name, (local_iterations, local_values) in self.local_results.items():
                 iterations, ranks, values = self.results[var_name]
@@ -305,6 +318,11 @@ class ModelTracer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.model.forward = self.original_forward
 
+        # Final callbacks to, for example, stack tensors.
+        for callback in self.post_trace_callbacks:
+            for name, (iterations, ranks, values) in self.results.items():
+                callback(name, values, iterations, ranks)
+
 
 def trace_model(
     model: nn.Module, 
@@ -334,3 +352,68 @@ class TracedModel(nn.Module):
     def forward(self, *args, **kwargs):
         with self.tracer:
             return self.model(*args, **kwargs)
+
+
+def stack_tensors(name, values: list, iterations: list, ranks: Optional[list]=None):
+    if values:
+        stacked_values = torch.stack(values)
+    else:
+        stacked_values = torch.tensor([])  # Handle empty 'values' if necessary
+    values.clear()
+    values.append(stacked_values)
+
+    """
+    if not isinstance(iterations[0], torch.Tensor):
+        stacked_iterations = torch.tensor(iterations)
+        iterations.clear()
+        iterations.append(stacked_iterations)
+    if ranks and not isinstance(ranks[0], torch.Tensor):
+        stacked_ranks = torch.tensor(ranks)
+        ranks.clear()
+        ranks.append(stacked_ranks)
+    """
+
+
+def stack_padded_tensors(name, values: list, iterations: list, ranks: Optional[list] = None):
+    # Process 'values' to ensure all tensors are padded to the same shape
+    if values:
+        max_dims = max(t.ndim for t in values)
+        padded_tensors = []
+        # Expand each tensor with leading dimensions to match max_dims
+        for t in values:
+            while t.ndim < max_dims:
+                t = t.unsqueeze(0)
+            padded_tensors.append(t)
+        # Determine the maximum size for each dimension
+        max_sizes = [max(t.shape[i] for t in padded_tensors) for i in range(max_dims)]
+        # Pad each tensor to the max sizes
+        padded_values = []
+        for t in padded_tensors:
+            pad = []
+            # Iterate dimensions from last to first to build padding tuple
+            for i in reversed(range(max_dims)):
+                pad_needed = max_sizes[i] - t.shape[i]
+                pad.extend([0, pad_needed])
+            padded_t = F.pad(t, pad)
+            padded_values.append(padded_t)
+        stacked_values = torch.stack(padded_values)
+    else:
+        stacked_values = torch.tensor([])  # Handle empty 'values' if necessary
+
+    # Update 'values' list with the stacked tensor
+    values.clear()
+    values.append(stacked_values)
+
+    # Process 'iterations' if not already tensors
+    """
+    if iterations and not isinstance(iterations[0], torch.Tensor):
+        stacked_iterations = torch.tensor(iterations)
+        iterations.clear()
+        iterations.append(stacked_iterations)
+
+    # Process 'ranks' if provided and not already tensors
+    if ranks and not isinstance(ranks[0], torch.Tensor):
+        stacked_ranks = torch.tensor(ranks)
+        ranks.clear()
+        ranks.append(stacked_ranks)
+    """
