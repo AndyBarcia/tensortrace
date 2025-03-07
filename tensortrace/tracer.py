@@ -1,9 +1,12 @@
 import torch
 import torch.nn as nn
-from typing import List, Dict, Any
+from torch.nn.parallel import DistributedDataParallel, DataParallel
+from typing import List, Dict, DefaultDict, Any, Tuple
 import sys
 from copy import deepcopy
 from functools import partial
+from collections import defaultdict
+import torch.distributed as dist
 
 from .utils import extract_nested_values
 
@@ -32,6 +35,7 @@ class ModelTracer:
         model: nn.Module, 
         variables: List[str], 
         trace_interval = 1,
+        gathering_interval = 1,
         eval_only = False,
         train_only = False,
     ):
@@ -42,9 +46,17 @@ class ModelTracer:
             model (nn.Module): PyTorch model to trace
             variables (List[str]): List of variable paths to track
         """
-        self.model = model
+        
+        # If this model is DDP or DP get the underlying model so that all
+        # variable paths still make sense without appending "module." to them.
+        if isinstance(model, (DistributedDataParallel, DataParallel)):
+            self.model = model.module
+        else:
+            self.model = model
+
         self.variables = variables
         self.trace_interval = trace_interval
+        self.gathering_interval = gathering_interval
         self.eval_only = eval_only
         self.train_only = train_only
 
@@ -59,11 +71,19 @@ class ModelTracer:
             for name, mod in self.model.named_modules()
         }
 
-        # Results of saved variables, including tensors and other values
-        self.results = {}
-        self.results_iterations = {}
+        # Local process storage (reset after gathering), with tuples (iteration, value)
+        self.local_results: Dict[str, List[Tuple[int, Any]]] = {}
 
-        # Tracking data for change detection
+        # Global aggregated storage (on rank 0), with tuples (iteration, rank, value) 
+        self.results: DefaultDict[str, List[Tuple[int, int, Any]]] = defaultdict(list)
+
+        # Determine rank of this tracer.
+        self.rank = 0
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+
+        # Tracking data for change detection. This is only relevant to
+        # this process' rank.
         self.last_result_data_ptr = {}
         self.last_result_version_counter = {}
 
@@ -83,14 +103,12 @@ class ModelTracer:
             if (
                 self.last_result_data_ptr.get(var_name) != id(value) or
                 self.last_result_version_counter.get(var_name) != value._version or
-                self.current_iteration != self.results_iterations.get(var_name, [0])[-1]
+                self.current_iteration != self.local_results.get(var_name, [(0,None)])[-1][0]
             ):
-                if var_name not in self.results:
-                    self.results[var_name] = [value.clone().detach()]
-                    self.results_iterations[var_name] = [self.current_iteration]
+                if var_name not in self.local_results:
+                    self.local_results[var_name] = [(self.current_iteration, value.clone().detach().cpu())]
                 else:
-                    self.results[var_name].append(value.clone().detach())
-                    self.results_iterations[var_name].append(self.current_iteration)
+                    self.local_results[var_name].append((self.current_iteration, value.clone().detach().cpu()))
                 
                 # Save tensor data pointer and version counter to keep track of future changes.
                 self.last_result_data_ptr[var_name] = id(value)
@@ -98,12 +116,10 @@ class ModelTracer:
         elif isinstance(value, (int, float, complex, str, bytes, bool, type(None))):
             # If it's a simple type, just compare it to check if it changed
             if type(value) != type(self.last_result_data_ptr.get(var_name)) or value != self.last_result_data_ptr.get(var_name):
-                if var_name not in self.results:
-                    self.results[var_name] = [deepcopy(value)]
-                    self.results_iterations[var_name] = [self.current_iteration]
+                if var_name not in self.local_results:
+                    self.local_results[var_name] = [(self.current_iteration, deepcopy(value))]
                 else:
-                    self.results[var_name].append(deepcopy(value))
-                    self.results_iterations[var_name].append(self.current_iteration)
+                    self.local_results[var_name].append((self.current_iteration, deepcopy(value)))
                 
                 # Save value to check later if it changed
                 self.last_result_data_ptr[var_name] = value
@@ -111,12 +127,10 @@ class ModelTracer:
             # If it's a complex type that is not a tensor, just use its ID to check
             # for changes in the object, and save it with deepcopy.
             if id(value) != self.last_result_data_ptr.get(var_name):
-                if var_name not in self.results:
-                    self.results[var_name] = [deepcopy(value)]
-                    self.results_iterations[var_name] = [self.current_iteration]
+                if var_name not in self.local_results:
+                    self.local_results[var_name] = [(self.current_iteration, deepcopy(value))]
                 elif id(value) != self.last_result_data_ptr[var_name]:
-                    self.results[var_name].append(deepcopy(value))
-                    self.results_iterations[var_name].append(self.current_iteration)
+                    self.local_results[var_name].append((self.current_iteration, deepcopy(value)))
                     
                 self.last_result_data_ptr[var_name] = id(value)
 
@@ -185,6 +199,36 @@ class ModelTracer:
             return
         return partial(self._trace_calls, target_paths=target_paths)
 
+    def _gather_results(self):
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            # Gather results from all processes to rank 0
+            gathered_results = [{} for _ in range(world_size)] # List[R; Dict[str, List[N; Tuple[iteration, value]]]]
+            dist.gather_object(self.local_results, gathered_results if self.rank == 0 else None, dst=0)
+
+            if self.rank == 0:
+                # Temporary storage for all new (iteration, rank, value) entries per variable
+                merged_entries = defaultdict(list) # Dict[str, List[N; tuple]]
+                
+                # Collect all entries across ranks
+                for rank, rank_results in enumerate(gathered_results):
+                    for var_name, var_entries in rank_results.items():
+                        for it, val in var_entries:
+                            merged_entries[var_name].append((it, rank, val))
+                
+                # Sort and append entries to global results
+                for var_name, entries in merged_entries.items():
+                    # Add the sorted entries to the global results.
+                    self.results[var_name].extend(entries)
+        else:
+            # If this is not a distributed setup, just add the rank 0 identifier.
+            for var_name, entries in self.local_results.items():
+                for iteration, value in entries:
+                    self.results[var_name].append((iteration, 0, value))
+        
+        # Reset local storage after gathering
+        self.local_results.clear()
+
     def __enter__(self):
         # When entering the context, we need to wrap the model's forward function
         # to enable tracing. After exiting the context, we will restore the original 
@@ -202,16 +246,26 @@ class ModelTracer:
                 return self.original_forward(*args, **kwargs)
 
             self.current_iteration += 1
+
+            # Determine if it is needed to trace in this iteration. If it is,
+            # setup the tracing function.
             trace_needed = self.current_iteration % self.trace_interval == 0
             if trace_needed:
                 original_trace = sys.gettrace()
                 sys.settrace(partial(self._trace_calls, target_paths=self.target_paths))
 
+            # Actually call the model, remembering to always reset the tracing 
+            # function after finishing.
             try:
                 output = self.original_forward(*args, **kwargs)
             finally:
                 if trace_needed:
                     sys.settrace(original_trace)
+            
+            # Determine if it is time to gather the results of all ranks in rank0.
+            gathering_needed = self.current_iteration % self.gathering_interval == 0
+            if gathering_needed:
+                self._gather_results()
 
             return output
 
