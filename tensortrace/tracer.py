@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel, DataParallel
-from typing import List, Dict, DefaultDict, Any, Tuple
+from typing import List, Dict, DefaultDict, Any, Tuple, Callable
 import sys
 from copy import deepcopy
 from functools import partial
@@ -36,6 +36,9 @@ class ModelTracer:
         variables: List[str], 
         trace_interval = 1,
         gathering_interval = 1,
+        pre_save_callbacks: List[Callable[[str, Any, int], Any]] = [],
+        pre_gather_callbacks: List[Callable[[str, List[Any], List[int]], None]] = [],
+        post_gather_callbacks: List[Callable[[str, List[Any], List[int], List[int]], None]] = [],
         eval_only = False,
         train_only = False,
     ):
@@ -59,6 +62,9 @@ class ModelTracer:
         self.gathering_interval = gathering_interval
         self.eval_only = eval_only
         self.train_only = train_only
+        self.pre_save_callbacks = pre_save_callbacks
+        self.pre_gather_callbacks = pre_gather_callbacks
+        self.post_gather_callbacks = post_gather_callbacks
 
         assert not (self.eval_only and self.train_only), "You can't set both 'eval_only' and 'train_only' to True."
 
@@ -71,11 +77,11 @@ class ModelTracer:
             for name, mod in self.model.named_modules()
         }
 
-        # Local process storage (reset after gathering), with tuples (iteration, value)
-        self.local_results: Dict[str, List[Tuple[int, Any]]] = {}
+        # Local process storage (reset after gathering), with tuples ([iterations], [values])
+        self.local_results: DefaultDict[str, Tuple[List[int], List[Any]]] = defaultdict(lambda: ([],[]))
 
         # Global aggregated storage (on rank 0), with tuples (iteration, rank, value) 
-        self.results: DefaultDict[str, List[Tuple[int, int, Any]]] = defaultdict(list)
+        self.results: DefaultDict[str, Tuple[List[int], List[int], List[Any]]] = defaultdict(lambda: ([],[],[]))
 
         # Determine rank of this tracer.
         self.rank = 0
@@ -94,6 +100,11 @@ class ModelTracer:
         self.original_trace = None
     
     def save_variable_result(self, var_name, value):
+        # Callback tha can be used to pre-process values before they are saved.
+        # For example, computing mean of batch dimensions to reduce memory.
+        for callback in self.pre_save_callbacks:
+            value = callback(var_name, value, self.current_iteration)
+
         if isinstance(value, torch.Tensor):
             # If it's a tensor, save it only if it changed with respect to the
             # previous version of the tensor, using its version counter to
@@ -103,12 +114,11 @@ class ModelTracer:
             if (
                 self.last_result_data_ptr.get(var_name) != id(value) or
                 self.last_result_version_counter.get(var_name) != value._version or
-                self.current_iteration != self.local_results.get(var_name, [(0,None)])[-1][0]
+                self.current_iteration != self.local_results.get(var_name, ([0],[None]))[0][-1]
             ):
-                if var_name not in self.local_results:
-                    self.local_results[var_name] = [(self.current_iteration, value.clone().detach().cpu())]
-                else:
-                    self.local_results[var_name].append((self.current_iteration, value.clone().detach().cpu()))
+                iterations, values = self.local_results[var_name]
+                iterations.append(self.current_iteration)
+                values.append(value.clone().detach().cpu())
                 
                 # Save tensor data pointer and version counter to keep track of future changes.
                 self.last_result_data_ptr[var_name] = id(value)
@@ -116,10 +126,9 @@ class ModelTracer:
         elif isinstance(value, (int, float, complex, str, bytes, bool, type(None))):
             # If it's a simple type, just compare it to check if it changed
             if type(value) != type(self.last_result_data_ptr.get(var_name)) or value != self.last_result_data_ptr.get(var_name):
-                if var_name not in self.local_results:
-                    self.local_results[var_name] = [(self.current_iteration, deepcopy(value))]
-                else:
-                    self.local_results[var_name].append((self.current_iteration, deepcopy(value)))
+                iterations, values = self.local_results[var_name]
+                iterations.append(self.current_iteration)
+                values.append(deepcopy(value))
                 
                 # Save value to check later if it changed
                 self.last_result_data_ptr[var_name] = value
@@ -127,10 +136,9 @@ class ModelTracer:
             # If it's a complex type that is not a tensor, just use its ID to check
             # for changes in the object, and save it with deepcopy.
             if id(value) != self.last_result_data_ptr.get(var_name):
-                if var_name not in self.local_results:
-                    self.local_results[var_name] = [(self.current_iteration, deepcopy(value))]
-                elif id(value) != self.last_result_data_ptr[var_name]:
-                    self.local_results[var_name].append((self.current_iteration, deepcopy(value)))
+                iterations, values = self.local_results[var_name]
+                iterations.append(self.current_iteration)
+                values.append(deepcopy(value))
                     
                 self.last_result_data_ptr[var_name] = id(value)
 
@@ -200,31 +208,53 @@ class ModelTracer:
         return partial(self._trace_calls, target_paths=target_paths)
 
     def _gather_results(self):
+        # Allow processing the values of several iterations together before they
+        # have to be transfered to rank0
+        for callback in self.pre_gather_callbacks:
+            for name, (iterations, values) in self.local_results.items():
+                callback(name, values, iterations)
+    
         if dist.is_initialized():
             world_size = dist.get_world_size()
             # Gather results from all processes to rank 0
-            gathered_results = [{} for _ in range(world_size)] # List[R; Dict[str, List[N; Tuple[iteration, value]]]]
-            dist.gather_object(self.local_results, gathered_results if self.rank == 0 else None, dst=0)
+            gathered_results = [{} for _ in range(world_size)] # List[R; Dict[str, Tuple[List[N; iteration], List[N; value]]]]]
+            dist.gather_object(dict(self.local_results), gathered_results if self.rank == 0 else None, dst=0)
 
             if self.rank == 0:
                 # Temporary storage for all new (iteration, rank, value) entries per variable
-                merged_entries = defaultdict(list) # Dict[str, List[N; tuple]]
+                merged_entries = defaultdict(lambda: ([],[],[])) # Dict[str, Tuple[List[N; iteration], List[N; rank], List[N; value]]]
                 
                 # Collect all entries across ranks
                 for rank, rank_results in enumerate(gathered_results):
-                    for var_name, var_entries in rank_results.items():
-                        for it, val in var_entries:
-                            merged_entries[var_name].append((it, rank, val))
-                
-                # Sort and append entries to global results
-                for var_name, entries in merged_entries.items():
-                    # Add the sorted entries to the global results.
-                    self.results[var_name].extend(entries)
+                    for var_name, (rank_iterations, rank_values) in rank_results.items():
+                        iterations, ranks, values = merged_entries[var_name]
+
+                        # Add iterations, values and ranks for this process
+                        iterations.extend(rank_iterations)
+                        values.extend(rank_values)
+                        ranks.extend([rank for _ in rank_iterations])
+                del gathered_results
+                        
+                # Allow processing the values of several iterations together after they
+                # have been grouped together.
+                for callback in self.post_gather_callbacks:
+                    for name, (iterations, ranks, values) in merged_entries.items():
+                        callback(name, values, iterations, ranks)
+
+                # Append entries to global results
+                for var_name, (iterations, ranks, values) in merged_entries.items():
+                    global_iterations, global_ranks, global_values = self.results[var_name]
+                    global_iterations.extend(iterations)
+                    global_ranks.extend(ranks)
+                    global_values.extend(values)
         else:
             # If this is not a distributed setup, just add the rank 0 identifier.
-            for var_name, entries in self.local_results.items():
-                for iteration, value in entries:
-                    self.results[var_name].append((iteration, 0, value))
+            for var_name, (local_iterations, local_values) in self.local_results.items():
+                iterations, ranks, values = self.results[var_name]
+
+                iterations.extend(local_iterations)
+                values.extend(local_values)
+                ranks.extend([0 for _ in local_iterations])
         
         # Reset local storage after gathering
         self.local_results.clear()
