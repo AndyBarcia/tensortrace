@@ -1,2 +1,2 @@
-from .tracer import ModelTracer, trace_model
-from .h5py_tracer import ModelTracerH5PY
+from .tracer import ModelTracer, trace_model, stack_tensors, stack_padded_tensors
+from .h5py_tracer import H5PYSaverCallback
