@@ -5,7 +5,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tensortrace import ModelTracer, stack_padded_tensors
+from tensortrace import ModelTracer, stack_padded_tensors, GlobalVariableResult, Variable
 
 from .utils import DummyDataset, SimpleModel, setup, cleanup
 
@@ -29,23 +29,23 @@ def train(rank, world_size):
     loss_fn = nn.CrossEntropyLoss()
 
     # Take the mean of all GPUs and all iteration collected since the last gathering.
-    def mean_post_gather(name, values, iterations, ranks):
-        values[0] = values[0].mean(dim=(0,1)) # (C)
-        pass
+    def mean_post_gather(name, results: GlobalVariableResult):
+        results.values = [results.values.mean(dim=(0,1))] # (G,B,C) -> (C)
+        results.iterations = results.iterations[:1] # (G,) -> (1,)
+        results.ranks = results.ranks[:1] # (G,) -> (1,)
 
-    tracer = ModelTracer(
-        model, 
+    variables = Variable(
         [
             "forward", # Save output of forward function
-            "forward.x", # Save input of forward function
-        ],
+            "forward.x", # Save input of forward function"
+        ], 
         post_gather_callbacks=[stack_padded_tensors, mean_post_gather],
         post_trace_callbacks=[stack_padded_tensors],
-        gathering_interval=4,
+        gather_interval=4
     )
 
     # Training loop
-    with tracer:
+    with ModelTracer(model, variables):
         for epoch in range(100):
             sampler.set_epoch(epoch)
             ddp_model.train()
@@ -64,7 +64,7 @@ def train(rank, world_size):
         # Tensor of shape (N//G,C), where 
         # - N is the number of iterations
         # - G is the gathering interval.
-        x = tracer.results['forward.x'].values[0] # (N//G,C)
+        x = variables.results['forward.x'].values # (N//G,C)
         print(x.shape)
 
     cleanup()

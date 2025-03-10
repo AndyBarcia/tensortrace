@@ -5,6 +5,8 @@ import h5py
 from pathlib import Path
 import torch.distributed as dist
 
+from .variable import GlobalVariableResult
+
 
 class H5PYSaverCallback():
     def __init__(
@@ -148,19 +150,19 @@ class H5PYSaverCallback():
         iteration_dataset.resize(iteration_dataset.shape[0] + len(iterations), axis=0)
         iteration_dataset[-len(iterations):] = iterations
     
-    def __call__(self, name, values, iterations, ranks):
+    def __call__(self, name, results: GlobalVariableResult):
         # Normalize all variables to numpy-compatible format
-        normalized_values = [self._get_normalized_value(x) for x in values]
+        normalized_values = [self._get_normalized_value(x) for x in results.values]
 
         # Determine type for writing
         if isinstance(normalized_values[0], (np.ndarray)):
-            self._write_tensor_dataset(name, normalized_values, iterations, ranks)
+            self._write_tensor_dataset(name, normalized_values, results.iterations, results.ranks)
         else:
-            self._write_simple_type_dataset(name, normalized_values, iterations, ranks)
+            self._write_simple_type_dataset(name, normalized_values, results.iterations, results.ranks)
         
-        values.clear()
-        iterations.clear()
-        ranks.clear()
+        results.values = None
+        results.iterations = None
+        results.ranks = None
 
     def close(self):
         if self.h5_file is not None:
